@@ -57,6 +57,9 @@ const QUESTION_CANCELLED_FEEDBACK =
 const PERMISSION_REJECTED_FEEDBACK =
   "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action."
 
+/** How long a quiet background read has to stay quiet before the run treats the tree as finished. */
+const QUIET_SETTLE_MS = 250
+
 /**
  * Runs one prompt to completion:
  *
@@ -180,7 +183,14 @@ export async function runNonInteractivePrompt(input: Input) {
 
   // The jobs this prompt started (older ones belong to someone else), or `[]` while one of their wakes
   // is queued or running. Work moves job → inbox → active, so reading in that order can't miss it.
-  const background = async () => {
+  //
+  // A single read can still land in a gap: a settled job's row is cleared as soon as its report is
+  // admitted, while the wake that report starts is only visible as an inbox item or an active
+  // execution a moment later. Concluding "finished" from one quiet read therefore drops whatever
+  // that wake goes on to start — the run then reports success while its own follow-up (a subagent
+  // launched in the resumed turn) is still running. `confirm` re-reads after a short settle so a
+  // quiet handoff has to be quiet twice.
+  const quiet = async () => {
     const since = (await state.admission)?.time.created
     if (since === undefined) return undefined
     const jobs = await input.client.experimental.job
@@ -190,7 +200,8 @@ export async function runNonInteractivePrompt(input: Input) {
         if (error instanceof ClientError && error.reason === "UnsupportedContentType") return []
         throw error
       })
-    const running = jobs.filter((job) => job.time.started >= since)
+    // Only a live job is pending work; a settled one is accounted for by its admitted report.
+    const running = jobs.filter((job) => job.time.started >= since && job.status === "running")
     running.forEach((job) => {
       state.jobSessions.add(job.sessionID)
       if (job.kind === "subagent") state.jobSessions.add(job.childSessionID)
@@ -205,6 +216,15 @@ export async function runNonInteractivePrompt(input: Input) {
       if (await ownsSession(sessionID)) return running
     }
     return undefined
+  }
+
+  // Two quiet reads, one settle apart: a handoff that turns into real work within the settle window
+  // keeps the run alive instead of being discarded as finished.
+  const background = async (options?: { readonly confirm?: boolean }) => {
+    const first = await quiet()
+    if (first || options?.confirm === false) return first
+    await new Promise((resolve) => setTimeout(resolve, QUIET_SETTLE_MS))
+    return quiet()
   }
 
   const lifecycle = async () => {
@@ -237,7 +257,9 @@ export async function runNonInteractivePrompt(input: Input) {
 
     // running → settling → waiting for this prompt's jobs
     let waited = false
-    let shown = 0
+    // What the stream already announced as pending: a different set of jobs is announced again,
+    // even when the count stays the same (a report can hand off to one new job).
+    let shown = ""
     while (true) {
       const ended = state.ended.promise
       await input.client.experimental.session.wait({ sessionID: input.sessionID })
@@ -246,8 +268,13 @@ export async function runNonInteractivePrompt(input: Input) {
       if (state.failure || state.outcomes.length > 0 || projected.messages.some((item) => item.type === "idle")) {
         const pending = state.failure ? undefined : await background()
         if (!pending) return { ...projected, background: waited }
-        if (pending.length > 0 && pending.length !== shown) render.waiting(pending)
-        shown = pending.length || shown
+        if (pending.length > 0) {
+          const announced = pending.map((job) => job.id).toSorted().join(",")
+          if (announced !== shown) {
+            render.waiting(pending)
+            shown = announced
+          }
+        }
         waited = true
       }
       await ended
@@ -261,7 +288,7 @@ export async function runNonInteractivePrompt(input: Input) {
     if (!(await state.admission?.catch(() => undefined))) return
     if (!state.promoted)
       await input.client.session.inbox.cancel({ sessionID: input.sessionID, inboxID: messageID }).catch(() => {})
-    const running = (await background().catch(() => undefined)) ?? []
+    const running = (await background({ confirm: false }).catch(() => undefined)) ?? []
     await Promise.all([
       input.client.session.interrupt({ sessionID: input.sessionID }).catch(() => {}),
       ...running.map((job) =>
@@ -276,7 +303,7 @@ export async function runNonInteractivePrompt(input: Input) {
     while (true) {
       const ended = state.ended.promise
       await input.client.experimental.session.wait({ sessionID: input.sessionID })
-      const pending = await background()
+      const pending = await background({ confirm: false })
       // Image jobs can't be cancelled through the API, so waiting on them would only hold the exit.
       if (!pending || (pending.length > 0 && pending.every((job) => job.kind === "image"))) return
       await ended

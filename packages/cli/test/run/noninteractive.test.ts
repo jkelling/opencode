@@ -264,6 +264,8 @@ async function run(input: {
   renderToolError?: (part: SessionMessageAssistantTool) => Promise<void>
   messages?: (inboxID: string) => SessionMessageInfo[]
   wait?: () => Promise<void>
+  /** Runs before each `session.wait`, so a test can deliver the events that wake a parked run. */
+  onWait?: (step: number, emit: (event: V2Event) => void) => void
   jobs?: () => ExperimentalJobListOutput
   inbox?: (sessionID: string) => SessionInboxListOutput
   active?: () => SessionActiveOutput
@@ -304,7 +306,16 @@ async function run(input: {
   )
   spyOn(sdk.session.form, "cancel").mockImplementation((request) => (input.cancel?.(request) ?? ok(undefined)) as never)
   let promptID = "msg_prompt"
-  spyOn(sdk.experimental.session, "wait").mockImplementation(() => input.wait?.() ?? wait.promise)
+  const emit = (event: V2Event) => {
+    values.push(event)
+    wake?.()
+    wake = undefined
+  }
+  let waits = 0
+  spyOn(sdk.experimental.session, "wait").mockImplementation(() => {
+    input.onWait?.(++waits, emit)
+    return input.wait?.() ?? wait.promise
+  })
   spyOn(sdk.experimental.job, "list").mockImplementation((async () => input.jobs?.() ?? []) as never)
   spyOn(sdk.session, "active").mockImplementation((async () => input.active?.() ?? {}) as never)
   spyOn(sdk.session.inbox, "list").mockImplementation(
@@ -862,6 +873,76 @@ describe("runNonInteractivePrompt", () => {
     })
     expect(output.exitCode).toBe(0)
     expect(output.stderr).not.toContain("waiting for")
+  })
+
+  test("waits for a job launched by the turn a background report woke", async () => {
+    // The first turn parks on `ses_child`; its report resumes the parent, and that resumed turn
+    // launches `ses_phase_b` and ends. Exiting here would discard the follow-up 18 s after launch.
+    const lists: ExperimentalJobListOutput[] = [[subagentJob], [{ ...subagentJob, id: "ses_phase_b" }], []]
+    const output = await capture({
+      format: "json",
+      jobs: () => lists.shift() ?? [],
+      messages: (messageID) => [
+        idleMessage("succeeded", "msg_report_idle"),
+        { id: messageID, type: "user", text: "hello", time: { created: 1 } },
+      ],
+      turn: (id) => [prompted(id), settled()],
+      onWait: (step, emit) => {
+        // While parked, the subagent's report wakes the parent; that turn then launches the next job.
+        if (step === 2)
+          emit({
+            id: "evt_child_done",
+            created: 2,
+            type: "session.execution.succeeded",
+            durable: { aggregateID: "ses_child", seq: 1, version: 1 },
+            data: { sessionID: "ses_child" },
+          })
+        if (step === 3) emit(settled())
+      },
+    })
+    const waits = jsonLines(output.stdout).filter((event) => event.type === "background_wait")
+    expect(waits.map((event) => event.jobs.map((job: { id: string }) => job.id))).toEqual([
+      ["ses_child"],
+      ["ses_phase_b"],
+    ])
+    expect(output.exitCode).toBe(0)
+  })
+
+  test("keeps waiting when a background read is momentarily empty", async () => {
+    // The report of a settled job is admitted a moment before the wake it queues is visible as an
+    // inbox item or a running execution: the first quiet read must not decide the run is finished.
+    let reads = 0
+    const controller = new AbortController()
+    const output = await capture({
+      format: "json",
+      signal: controller.signal,
+      jobs: () => {
+        reads += 1
+        if (reads === 1) return []
+        if (reads === 2) {
+          setTimeout(() => controller.abort(), 0)
+          return [shellJob("sh_late", "python late.py")]
+        }
+        return []
+      },
+      messages: (messageID) => [
+        idleMessage("succeeded", "msg_report_idle"),
+        { id: messageID, type: "user", text: "hello", time: { created: 1 } },
+      ],
+      turn: (id) => [
+        prompted(id),
+        settled(),
+        {
+          id: "evt_late_done",
+          created: 2,
+          type: "session.execution.succeeded",
+          durable: { aggregateID: "ses_1", seq: 2, version: 1 },
+          data: { sessionID: "ses_1" },
+        },
+      ],
+    })
+    expect(jsonLines(output.stdout).filter((event) => event.type === "background_wait")).toHaveLength(1)
+    expect(reads).toBeGreaterThanOrEqual(2)
   })
 
   test("cancelling while waiting on background work stops the Session and this prompt's jobs", async () => {
